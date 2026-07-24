@@ -1,0 +1,441 @@
+#!/usr/bin/env bash
+# meetrec — record meetings locally, transcribe with whisper.cpp, keep the audio.
+set -euo pipefail
+
+REC_DIR="${MEETREC_DIR:-$HOME/Recordings/meetings}"
+STATE_DIR="$HOME/Library/Application Support/meetrec"
+MODEL_DIR="$STATE_DIR/models"
+RUN_FILE="$STATE_DIR/current.json"
+LANG_DEFAULT="${MEETREC_LANG:-es}"
+# resolve through the ~/.local/bin symlink so the helper script is found
+SELF="${BASH_SOURCE[0]}"
+while [[ -L "$SELF" ]]; do
+  SELF_TARGET="$(readlink "$SELF")"
+  case "$SELF_TARGET" in
+    /*) SELF="$SELF_TARGET" ;;
+    *)  SELF="$(cd "$(dirname "$SELF")" && pwd)/$SELF_TARGET" ;;
+  esac
+done
+SELF_DIR="$(cd "$(dirname "$SELF")" && pwd)"
+
+mkdir -p "$REC_DIR" "$MODEL_DIR"
+
+die() { printf 'meetrec: %s\n' "$*" >&2; exit 1; }
+info() { printf '\033[36m%s\033[0m\n' "$*"; }
+ok() { printf '\033[32m%s\033[0m\n' "$*"; }
+warn() { printf '\033[33m%s\033[0m\n' "$*"; }
+
+need() { command -v "$1" >/dev/null 2>&1 || die "$1 not found. brew install $2"; }
+
+whisper_bin() {
+  for c in whisper-cli whisper-cpp main; do
+    command -v "$c" >/dev/null 2>&1 && { echo "$c"; return; }
+  done
+  die "whisper-cli not found. brew install whisper-cpp"
+}
+
+model_path() {
+  case "${1:-turbo}" in
+    turbo) echo "$MODEL_DIR/ggml-large-v3-turbo.bin" ;;
+    large) echo "$MODEL_DIR/ggml-large-v3.bin" ;;
+    *) echo "$1" ;;
+  esac
+}
+
+device_lines() {
+  # ffmpeg always exits non-zero after listing devices; don't let that kill the script
+  local raw
+  raw="$(ffmpeg -f avfoundation -list_devices true -i "" 2>&1 || true)"
+  printf '%s\n' "$raw" \
+    | awk '/AVFoundation audio devices/{f=1;next} f && /^\[AVFoundation/ {print}' \
+    | sed -E 's/.*\[([0-9]+)\] (.*)$/\1|\2/'
+}
+
+audio_index() {
+  # audio_index "<device name substring>" -> avfoundation audio device index
+  device_lines | awk -F'|' -v pat="$1" 'index(tolower($2), tolower(pat)) {print $1; exit}'
+}
+
+cmd_devices() {
+  info "Audio input devices:"
+  device_lines | awk -F'|' '{printf "  [%s] %s\n", $1, $2}'
+}
+
+slug_paths() {
+  local slug="$1" stamp base n=1
+  stamp="$(date +%Y-%m-%d)"
+  base="$REC_DIR/${stamp}_${slug}"
+  while compgen -G "${base}*.wav" >/dev/null; do base="$REC_DIR/${stamp}_${slug}-$((++n))"; done
+  BASE="$base"
+  WAV="${BASE}.wav"
+}
+
+busy_check() {
+  [[ -e "$RUN_FILE" ]] && die "a recording is already running (meetrec stop / meetrec status)"
+  return 0
+}
+
+# One ffmpeg process per audio device: a device dropping out mid-meeting can't
+# take the other side of the conversation down with it.
+# stdout/stderr MUST go to the log file — a backgrounded child inheriting the
+# caller's pipe holds it open and blocks the command substitution forever.
+spawn_capture() {
+  # spawn_capture <device-index> <wav>
+  local log="${2%.wav}.log"
+  caffeinate -i ffmpeg -hide_banner -loglevel warning -nostdin \
+    -thread_queue_size 4096 -f avfoundation -i ":$1" \
+    -c:a pcm_s16le -ar 48000 -ac 1 "$2" >"$log" 2>&1 &
+  echo $!
+}
+
+verify_running() {
+  # verify_running <pid> <wav> <label>
+  sleep 3
+  kill -0 "$1" 2>/dev/null || die "capture for $3 died on startup — check Microphone permission for your terminal in System Settings > Privacy & Security"
+  [[ -s "$2" ]] || warn "$3: no audio bytes yet — check the device is actually producing sound"
+}
+
+have_switcher() { command -v SwitchAudioSource >/dev/null 2>&1; }
+
+current_output() { have_switcher && SwitchAudioSource -c -t output 2>/dev/null || echo ""; }
+current_input()  { have_switcher && SwitchAudioSource -c -t input  2>/dev/null || echo ""; }
+
+# Route the Mac's output through Background Music so the far end of the call
+# lands in a capturable device. BGM.app passes the audio on to real hardware, so
+# you still hear the meeting; without it running you'd hear nothing.
+# Prints "<previous-output>|<1 if we launched BGM.app>". Runs in a subshell, so
+# it can't set globals — both facts have to come back in the string.
+bgm_target() { osascript -e 'tell application "Background Music" to get name of selected output device' 2>/dev/null; }
+
+# BGM forwards audio to whichever device it picked at launch, which is not
+# necessarily the one you're listening on — launch it while the laptop speakers
+# are default and your call comes out of the speakers instead of your headphones.
+set_bgm_target() {
+  osascript -e "tell application \"Background Music\" to set selected output device to (first output device whose name is \"$1\")" >/dev/null 2>&1
+}
+
+engage_output() {
+  have_switcher || { warn "SwitchAudioSource not installed — set output to 'Background Music' yourself (brew install switchaudio-osx to automate)"; echo "|0"; return; }
+  local prev launched=0; prev="$(current_output)"
+  [[ "$prev" == "Background Music" ]] && { echo "|0"; return; }
+  if ! pgrep -f "Background Music.app" >/dev/null 2>&1; then
+    open -a "Background Music" 2>/dev/null || { warn "couldn't launch Background Music.app"; echo "|0"; return; }
+    launched=1
+    sleep 6   # the driver hands out garbage until the app has settled
+  fi
+  # send the meeting to the device you were already listening on
+  set_bgm_target "$prev"
+  local tgt; tgt="$(bgm_target)"
+  if [[ "$tgt" != "$prev" ]]; then
+    warn "Background Music is playing out of '${tgt:-unknown}', not '$prev' — you'll hear the meeting there"
+  fi
+  SwitchAudioSource -s "Background Music" -t output >/dev/null 2>&1 || true
+  if [[ "$(current_output)" != "Background Music" ]]; then
+    warn "could not route output through Background Music — the far end will NOT be recorded"
+  fi
+  echo "${prev}|${launched}"
+}
+
+# Connecting AirPods (or any device macOS decides to prefer) steals the default
+# output mid-call, which silently cuts the far end out of the recording.
+start_output_guard() {
+  local log="$1"
+  ( while :; do
+      sleep 10
+      [[ -e "$RUN_FILE" ]] || exit 0
+      if [[ "$(SwitchAudioSource -c -t output 2>/dev/null)" != "Background Music" ]]; then
+        echo "$(date -Iseconds) output was stolen; re-routing through Background Music" >> "$log"
+        SwitchAudioSource -s "Background Music" -t output >/dev/null 2>&1 || true
+      fi
+    done ) >/dev/null 2>&1 &
+  echo $!
+}
+
+# BGM.app pins itself as the default output for as long as it runs, so the
+# device can only be handed back after quitting it.
+restore_output() {
+  local prev="${1%%|*}" launched="${1##*|}"
+  [[ -n "$prev" ]] || return 0
+  have_switcher || return 0
+  if [[ "$launched" == "1" ]]; then
+    osascript -e 'quit app "Background Music"' >/dev/null 2>&1 || true
+    sleep 2
+  fi
+  SwitchAudioSource -a -t output 2>/dev/null | grep -qxF "$prev" || { warn "previous output device '$prev' is gone; leaving output as is"; return 0; }
+  SwitchAudioSource -s "$prev" -t output >/dev/null 2>&1 || true
+  local now; now="$(current_output)"
+  if [[ "$now" == "$prev" ]]; then
+    info "output restored to $prev"
+  else
+    warn "wanted to restore output to '$prev' but it is now '$now' — set it in Sound settings"
+  fi
+}
+
+cmd_call() {
+  local slug="${1:-call}"
+  need ffmpeg ffmpeg
+  busy_check
+  local prev_out; prev_out="$(engage_output)"
+  local sys mic mic_name
+  # default the mic to whatever the system (and therefore the meeting app) is using
+  mic_name="${MEETREC_MIC:-$(current_input)}"
+  [[ -n "$mic_name" ]] || mic_name="MacBook Pro Microphone"
+  # Opening a wireless headset's mic drops the headset into headset mode, which
+  # halves its output rate (AirPods: 48k -> 24k). Background Music keeps feeding
+  # 48k, so the meeting plays back at half speed an octave down. Recording your
+  # voice from the built-in mic instead keeps the headset in output-only mode.
+  if [[ -z "${MEETREC_MIC:-}" && -n "${prev_out%%|*}" && "$mic_name" == "${prev_out%%|*}" ]]; then
+    warn "'$mic_name' is both your speaker and mic — recording from it would slow the meeting audio to half speed in your ears"
+    mic_name="MacBook Pro Microphone"
+    warn "using the built-in mic instead; set your meeting app's mic to the MacBook mic too (MEETREC_MIC overrides)"
+  fi
+  sys="$(audio_index "Background Music")" || true
+  mic="$(audio_index "$mic_name")" || true
+  [[ -n "${sys:-}" ]] || die "no 'Background Music' device — install it (brew install --cask background-music) so system audio can be captured"
+  [[ -n "${mic:-}" ]] || die "mic device '$mic_name' not found; run 'meetrec devices', then set MEETREC_MIC"
+  info "them ← Background Music (system audio) · you ← $mic_name"
+  slug_paths "$slug"
+  local pt pm
+  pt="$(spawn_capture "$sys" "${BASE}.them.wav")"
+  pm="$(spawn_capture "$mic" "${BASE}.me.wav")"
+  verify_running "$pt" "${BASE}.them.wav" "them (system audio)"
+  verify_running "$pm" "${BASE}.me.wav" "you (mic)"
+  { echo "mode=call"; echo "started=$(date -Iseconds)"; echo "prev_output=$prev_out";
+    echo "pid=$pt wav=${BASE}.them.wav"; echo "pid=$pm wav=${BASE}.me.wav"; } > "$RUN_FILE"
+  local guard; guard="$(start_output_guard "${BASE}.guard.log")"
+  echo "guard=$guard" >> "$RUN_FILE"
+  ok "recording (call)"
+  [[ -n "$(bgm_target)" ]] && echo "   you'll hear the meeting on: $(bgm_target)"
+  echo "   them → ${BASE}.them.wav"
+  echo "   you  → ${BASE}.me.wav"
+  [[ -n "${prev_out%%|*}" ]] && echo "   output routed via Background Music (restored to '${prev_out%%|*}' on stop)"
+  echo "   in Teams/Zoom, set the speaker to 'Background Music' or 'Same as System'"
+  echo "   stop with: meetrec stop"
+}
+
+cmd_room() {
+  local slug="${1:-room}" dev="${MEETREC_ROOM_DEVICE:-}"
+  need ffmpeg ffmpeg
+  if [[ -z "$dev" ]]; then
+    dev="$(audio_index "MacBook Pro Microphone")"
+    warn "using the built-in mic. For anything across a table, use the DJI Mic Mini recording internally and 'meetrec import' the file."
+  fi
+  busy_check
+  slug_paths "$slug"
+  local p; p="$(spawn_capture "$dev" "$WAV")"
+  verify_running "$p" "$WAV" "room mic"
+  { echo "mode=room"; echo "started=$(date -Iseconds)"; echo "pid=$p wav=$WAV"; } > "$RUN_FILE"
+  ok "recording (room) → $WAV"
+  echo "   stop with: meetrec stop"
+}
+
+run_pids() { grep -oE '^pid=[0-9]+' "$RUN_FILE" | cut -d= -f2; }
+run_wavs() { sed -nE 's/^pid=[0-9]+ wav=(.*)$/\1/p' "$RUN_FILE"; }
+
+cmd_stop() {
+  [[ -e "$RUN_FILE" ]] || die "nothing recording"
+  local pids wavs pid f base found=0 prev_out
+  pids="$(run_pids)"; wavs="$(run_wavs)"
+  prev_out="$(sed -nE 's/^prev_output=(.*)$/\1/p' "$RUN_FILE")"
+  local guard; guard="$(sed -nE 's/^guard=([0-9]+)$/\1/p' "$RUN_FILE")"
+  [[ -n "$guard" ]] && kill "$guard" 2>/dev/null || true
+  for pid in $pids; do kill -INT "$pid" 2>/dev/null || true; done
+  for _ in $(seq 1 20); do
+    local alive=0
+    for pid in $pids; do kill -0 "$pid" 2>/dev/null && alive=1; done
+    [[ "$alive" == 0 ]] && break
+    sleep 0.5
+  done
+  for pid in $pids; do kill -0 "$pid" 2>/dev/null && kill -TERM "$pid" 2>/dev/null || true; done
+  rm -f "$RUN_FILE"
+  restore_output "$prev_out"
+  while IFS= read -r f; do
+    [[ -s "$f" ]] || { warn "empty: $f"; continue; }
+    found=1
+    local peak; peak="$(ffmpeg -hide_banner -nostdin -i "$f" -af volumedetect -f null - 2>&1 | sed -nE 's/.*max_volume: (-?[0-9.]+) dB.*/\1/p' | tail -1)"
+    ok "saved $f ($(du -h "$f" | cut -f1), $(ffprobe -v error -show_entries format=duration -of csv=p=0 "$f" 2>/dev/null | cut -d. -f1)s, peak ${peak:-?} dB)"
+    # -60 dB peak over a whole meeting means the track captured nothing usable
+    if [[ -n "$peak" ]] && awk "BEGIN{exit !($peak < -60)}"; then
+      warn "  ^ that track is effectively silent — nothing usable was captured on it"
+    fi
+    base="${f%.them.wav}"; base="${base%.me.wav}"; base="${base%.wav}"
+  done <<< "$wavs"
+  [[ "$found" == 1 ]] || die "no audio was written — nothing recorded"
+  echo "   transcribe with: meetrec transcribe \"$base\""
+}
+
+cmd_status() {
+  [[ -e "$RUN_FILE" ]] || { echo "idle"; return; }
+  local pid alive=0
+  for pid in $(run_pids); do kill -0 "$pid" 2>/dev/null && alive=$((alive+1)); done
+  cat "$RUN_FILE"
+  [[ "$alive" -gt 0 ]] || warn "stale run file — no capture process alive; run 'meetrec stop' to clear"
+}
+
+cmd_import() {
+  local src="${1:?usage: meetrec import <file> [slug]}" slug="${2:-import}"
+  [[ -f "$src" ]] || die "no such file: $src"
+  slug_paths "$slug"
+  ffmpeg -hide_banner -loglevel error -i "$src" -c:a pcm_s16le -ar 48000 "$WAV"
+  ok "imported → $WAV"
+  echo "   transcribe with: meetrec transcribe \"$WAV\""
+}
+
+cmd_transcribe() {
+  local src="" model="turbo" lang="$LANG_DEFAULT"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --model) model="$2"; shift 2 ;;
+      --lang) lang="$2"; shift 2 ;;
+      *) src="$1"; shift ;;
+    esac
+  done
+  [[ -n "$src" ]] || die "usage: meetrec transcribe <file|base> [--model turbo|large] [--lang es]"
+  # accept a file, a base name, a bare slug (recordings are date-prefixed), or
+  # any of those relative to $REC_DIR
+  resolve() {
+    local c m
+    for c in "$1" "$REC_DIR/$1"; do
+      [[ -f "$c" ]] && { echo "$c"; return 0; }
+      [[ -f "$c.them.wav" ]] && { echo "$c.them.wav"; return 0; }
+      [[ -f "$c.wav" ]] && { echo "$c.wav"; return 0; }
+    done
+    # bare slug: newest date-prefixed match wins
+    m="$(ls -t "$REC_DIR"/*_"$1".them.wav "$REC_DIR"/*_"$1".wav 2>/dev/null | head -1)"
+    [[ -n "$m" ]] && { echo "$m"; return 0; }
+    return 1
+  }
+  local want="$src"
+  src="$(resolve "$want")" || die "no such recording: $want (meetrec list)"
+
+  local wb mp vad base
+  wb="$(whisper_bin)"; mp="$(model_path "$model")"
+  vad="$MODEL_DIR/ggml-silero-v5.1.2.bin"
+  [[ -f "$mp" ]] || die "model missing: $mp — run: meetrec fetch-model $model"
+  [[ -f "$vad" ]] || die "VAD model missing — run: meetrec fetch-model vad"
+
+  base="${src%.them.wav}"; base="${base%.me.wav}"; base="${base%.wav}"
+  local tmp; tmp="$(mktemp -d)"
+  trap 'rm -rf "$tmp"' RETURN
+
+  # whisper hallucinates filler ("Gracias por ver el video") into silence, and each
+  # speaker's channel is silent whenever the other is talking. VAD gates that out.
+  run_whisper() {
+    "$wb" -m "$mp" -f "$1" -l "$lang" -oj -of "$2" \
+      --vad --vad-model "$vad" -sns -nth 0.6 -et 2.4 -lpt -1.0 -pp >/dev/null 2>&1
+  }
+  prep() { ffmpeg -hide_banner -loglevel error -y -i "$1" -ar 16000 -ac 1 -c:a pcm_s16le "$2"; }
+
+  if [[ -f "$base.them.wav" && -f "$base.me.wav" ]]; then
+    info "two-track call — transcribing each speaker separately"
+    prep "$base.them.wav" "$tmp/them.wav"; prep "$base.me.wav" "$tmp/me.wav"
+    info "  whisper: them"; run_whisper "$tmp/them.wav" "$tmp/them"
+    info "  whisper: me";   run_whisper "$tmp/me.wav"   "$tmp/me"
+    python3 "$SELF_DIR/merge_channels.py" "$tmp/them.json" "$tmp/me.json" > "${base}.transcript.md"
+  elif [[ "$(ffprobe -v error -select_streams a:0 -show_entries stream=channels -of csv=p=0 "$src")" == "2" ]]; then
+    info "stereo source — splitting channels into speakers"
+    ffmpeg -hide_banner -loglevel error -y -i "$src" \
+      -filter_complex "[0:a]channelsplit=channel_layout=stereo[L][R]" \
+      -map "[L]" -ar 16000 -ac 1 -c:a pcm_s16le "$tmp/them.wav" \
+      -map "[R]" -ar 16000 -ac 1 -c:a pcm_s16le "$tmp/me.wav"
+    info "  whisper: them"; run_whisper "$tmp/them.wav" "$tmp/them"
+    info "  whisper: me";   run_whisper "$tmp/me.wav"   "$tmp/me"
+    python3 "$SELF_DIR/merge_channels.py" "$tmp/them.json" "$tmp/me.json" > "${base}.transcript.md"
+  else
+    info "mono source — single-track transcript (no speaker labels)"
+    prep "$src" "$tmp/mono.wav"
+    run_whisper "$tmp/mono.wav" "$tmp/mono"
+    python3 "$SELF_DIR/merge_channels.py" "$tmp/mono.json" > "${base}.transcript.md"
+  fi
+  ok "transcript → ${base}.transcript.md"
+  echo "   $(wc -w < "${base}.transcript.md" | tr -d ' ') words"
+}
+
+cmd_fetch_model() {
+  local which="${1:-turbo}" url out
+  case "$which" in
+    turbo) url="https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3-turbo.bin"; out="$MODEL_DIR/ggml-large-v3-turbo.bin" ;;
+    large) url="https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-large-v3.bin"; out="$MODEL_DIR/ggml-large-v3.bin" ;;
+    vad)   url="https://huggingface.co/ggml-org/whisper-vad/resolve/main/ggml-silero-v5.1.2.bin"; out="$MODEL_DIR/ggml-silero-v5.1.2.bin" ;;
+    *) die "unknown model: $which (turbo|large|vad)" ;;
+  esac
+  [[ -f "$out" ]] && { ok "already have $out"; return; }
+  info "downloading $which model…"
+  curl -L --fail --progress-bar "$url" -o "$out.part" && mv "$out.part" "$out"
+  ok "$out"
+}
+
+cmd_list() {
+  ls -lht "$REC_DIR" 2>/dev/null | tail -n +2 | awk '{printf "%-12s %s\n", $5, substr($0, index($0,$9))}'
+}
+
+cmd_check() {
+  local fails=0
+  chk() { if eval "$2" >/dev/null 2>&1; then printf '  \033[32mok\033[0m   %s\n' "$1"; else printf '  \033[31mFAIL\033[0m %s\n' "$1"; fails=$((fails+1)); fi; }
+  info "meetrec pre-flight"
+  chk "ffmpeg installed"            "command -v ffmpeg"
+  chk "whisper-cli installed"       "command -v whisper-cli"
+  chk "SwitchAudioSource installed" "command -v SwitchAudioSource"
+  chk "Background Music device"     "[[ -n \"\$(audio_index 'Background Music')\" ]]"
+  chk "Background Music.app present" "[[ -d '/Applications/Background Music.app' ]]"
+  chk "transcription model (large)" "[[ -f '$MODEL_DIR/ggml-large-v3.bin' ]]"
+  chk "VAD model"                   "[[ -f '$MODEL_DIR/ggml-silero-v5.1.2.bin' ]]"
+
+  info "live capture test (3s, both tracks)"
+  local tmp; tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' RETURN
+  local prev; prev="$(engage_output)"
+  local sys mic mic_name
+  mic_name="${MEETREC_MIC:-$(current_input)}"; [[ -n "$mic_name" ]] || mic_name="MacBook Pro Microphone"
+  sys="$(audio_index "Background Music")"; mic="$(audio_index "$mic_name")"
+  ( ffmpeg -hide_banner -loglevel error -nostdin -f avfoundation -i ":$sys" -t 3 -c:a pcm_s16le -ar 48000 -ac 1 -y "$tmp/them.wav" >/dev/null 2>&1 ) &
+  local p1=$!
+  ( ffmpeg -hide_banner -loglevel error -nostdin -f avfoundation -i ":$mic" -t 3 -c:a pcm_s16le -ar 48000 -ac 1 -y "$tmp/me.wav" >/dev/null 2>&1 ) &
+  local p2=$!
+  sleep 1; say -v "${MEETREC_TEST_VOICE:-Monica}" "Prueba de sonido." >/dev/null 2>&1 || true
+  wait $p1 $p2 2>/dev/null || true
+  restore_output "$prev"
+  local pk
+  for side in them me; do
+    pk="$(ffmpeg -hide_banner -nostdin -i "$tmp/$side.wav" -af volumedetect -f null - 2>&1 | sed -nE 's/.*max_volume: (-?[0-9.]+) dB.*/\1/p' | tail -1)"
+    if [[ -n "$pk" ]] && awk "BEGIN{exit !($pk > -60)}"; then
+      printf '  \033[32mok\033[0m   %s track has signal (peak %s dB)\n' "$side" "$pk"
+    else
+      printf '  \033[31mFAIL\033[0m %s track silent (peak %s dB)\n' "$side" "${pk:-none}"; fails=$((fails+1))
+    fi
+  done
+  [[ "$fails" == 0 ]] && ok "ready" || { warn "$fails problem(s) — see README"; return 1; }
+}
+
+usage() {
+  cat <<'EOF'
+meetrec — local meeting recorder + transcriber
+
+  meetrec check              pre-flight: tools, models, and a live 3s capture test
+  meetrec call <slug>        record a video call (system audio + your mic, split channels)
+  meetrec room <slug>        record an in-person meeting from a mic device
+  meetrec stop               stop and finalize the current recording
+  meetrec status             is anything recording
+  meetrec import <file> [slug]  bring in an external recording (DJI Mic Mini, phone)
+  meetrec transcribe <file> [--model turbo|large] [--lang es]
+  meetrec fetch-model turbo|large
+  meetrec devices            list audio inputs
+  meetrec list               list recordings
+
+Env: MEETREC_DIR, MEETREC_LANG (default es), MEETREC_MIC, MEETREC_ROOM_DEVICE
+EOF
+}
+
+case "${1:-}" in
+  check) shift; cmd_check "$@" ;;
+  call) shift; cmd_call "$@" ;;
+  room) shift; cmd_room "$@" ;;
+  stop) shift; cmd_stop "$@" ;;
+  status) shift; cmd_status "$@" ;;
+  import) shift; cmd_import "$@" ;;
+  transcribe) shift; cmd_transcribe "$@" ;;
+  fetch-model) shift; cmd_fetch_model "$@" ;;
+  devices) shift; cmd_devices "$@" ;;
+  list) shift; cmd_list "$@" ;;
+  ""|-h|--help|help) usage ;;
+  *) die "unknown command: $1" ;;
+esac
