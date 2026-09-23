@@ -17,6 +17,8 @@ Meeting-notes services summarize and throw the recording away. When the summary 
 
 `meetrec` records to disk first and treats the transcript as a derived artifact you can regenerate with a better model, a different language, or more patience. Recording is `ffmpeg`, transcription is `whisper.cpp` on Metal. Nothing is uploaded and no account is involved.
 
+It's macOS-only: recording relies on ffmpeg's AVFoundation input, the Background Music virtual device and macOS audio routing, none of which exist on Linux or Windows.
+
 There's no integration with Teams, Meet or Zoom, and no bot joins the call. It captures whatever plays out of the speakers plus your mic, so the meeting platform is irrelevant. A phone on speaker next to the laptop works the same way.
 
 ## Install
