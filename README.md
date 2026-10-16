@@ -17,7 +17,7 @@ Meeting-notes services summarize and throw the recording away. When the summary 
 
 `meetrec` records to disk first and treats the transcript as a derived artifact you can regenerate with a better model, a different language, or more patience. Recording is `ffmpeg`, transcription is `whisper.cpp` on Metal. Nothing is uploaded and no account is involved.
 
-It's macOS-only: recording relies on ffmpeg's AVFoundation input, the Background Music virtual device and macOS audio routing, none of which exist on Linux or Windows.
+It's macOS-only: recording relies on Core Audio process taps, ffmpeg's AVFoundation input and macOS audio routing, none of which exist on Linux or Windows.
 
 There's no integration with Teams, Meet or Zoom, and no bot joins the call. It captures whatever plays out of the speakers plus your mic, so the meeting platform is irrelevant. A phone on speaker next to the laptop works the same way.
 
@@ -25,7 +25,11 @@ There's no integration with Teams, Meet or Zoom, and no bot joins the call. It c
 
 ```bash
 brew install ffmpeg whisper-cpp switchaudio-osx
-brew install --cask background-music     # virtual device for capturing system audio
+
+# system audio: audiotee uses Core Audio process taps (macOS 14.2+), no virtual device
+git clone https://github.com/makeusabrew/audiotee.git
+(cd audiotee && swift build -c release) && cp audiotee/.build/release/audiotee ~/.local/bin/
+
 git clone https://github.com/jgalea/meetrec.git
 ln -sf "$PWD/meetrec/bin/meetrec" ~/.local/bin/meetrec
 
@@ -35,9 +39,9 @@ meetrec fetch-model vad     # 865 KB, required
 meetrec check               # verifies the lot, including a live capture test
 ```
 
-Your terminal needs Microphone permission (System Settings > Privacy & Security > Microphone).
+Your terminal needs Microphone permission and System Audio Recording permission (System Settings > Privacy & Security). macOS asks for the second one the first time `audiotee` runs.
 
-If Background Music was downloaded with a browser it may be quarantined, in which case macOS runs it from a randomized path and a capture started in the first seconds after launch can hang. `meetrec call` waits that window out, but clearing it is cleaner: `sudo xattr -dr com.apple.quarantine "/Applications/Background Music.app"`.
+Without `audiotee`, `call` falls back to the [Background Music](https://github.com/kyleneideck/BackgroundMusic) virtual device (`brew install --cask background-music`), which needs every app's audio routed through it. On macOS 26 it garbled playback and its capture device hung, so treat it as a last resort. `MEETREC_BGM=1` forces it.
 
 ## Video calls
 
@@ -49,19 +53,17 @@ meetrec stop
 meetrec transcribe acme-kickoff --model large --lang es
 ```
 
-`call` handles the audio routing itself. It launches Background Music, pins its forwarding target to the device you were already listening on, points the system output at it so the far end becomes capturable, and puts everything back on `stop`.
+`call` taps whatever the Mac plays, before it reaches your speakers or headphones. Nothing in the output path changes, so the meeting app can use any speaker, including AirPods.
 
 Two files come out: `*.them.wav` (system audio, everyone else) and `*.me.wav` (your mic). They're written by separate `ffmpeg` processes, so a device dropping out mid-meeting can't take the other side of the conversation with it. Separate tracks also give speaker labels for free, with no diarization model. `stop` reports a peak level per track and says outright if one captured nothing.
 
 Things worth knowing before your first real call:
 
-**Teams, Zoom and the WhatsApp desktop app have their own speaker and mic pickers.** If the speaker names a specific device, the audio bypasses Background Music and the far end records silent. Set it to "Background Music" or "Same as System", and set the mic to the built-in one or "System default", never the headset. Meet in a browser follows the system device and needs nothing.
+**Set the meeting app's mic to the built-in one or "System default", never a wireless headset.** Teams, Zoom and the WhatsApp desktop app each have their own mic picker, and that choice never shows up in the system settings.
 
 **Wear headphones.** On speakers the far end bleeds into your mic and both tracks transcribe the same words twice.
 
-**Wireless headsets can't be both speaker and mic here.** Opening an AirPods mic drops the headset into headset mode and halves its output rate, while Background Music keeps feeding 48 kHz, so the meeting plays back at half speed an octave down. When the mic and speaker resolve to the same wireless device, `call` falls back to the built-in mic and tells you to point the meeting app's mic at it too. Override with `MEETREC_MIC`.
-
-**Something can steal the default output mid-call.** Connecting AirPods is enough, and it silently cuts the far end out of the recording. A guard checks every 10 seconds and re-routes, logging each occurrence to a `.guard.log` beside the recording. The same guard moves the system mic back off a wireless headset when a meeting app grabs it, which otherwise makes the call stutter.
+**Wireless headsets can't be both speaker and mic.** Opening an AirPods mic drops the headset into headset mode: output falls from 48 kHz to 24 kHz and the call stutters. When the mic and speaker resolve to the same wireless device, `call` records from the built-in mic instead. Override with `MEETREC_MIC`. A guard checks every 10 seconds, logging to a `.guard.log` beside the recording. It moves the system mic back off the headset, and when an app opens the headset mic through its own settings, it spots the sample-rate drop and raises a notification.
 
 **A capture can stall without exiting.** When Core Audio hiccups, ffmpeg can keep running while its file stops growing, so one side of the call records nothing. The guard checks both files every 10 seconds and raises a notification on a stall. `stop` force-kills a hung capture so it can't keep holding the device into the next recording.
 

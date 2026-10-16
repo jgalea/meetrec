@@ -54,7 +54,11 @@ device_lines() {
 
 audio_index() {
   # audio_index "<device name substring>" -> avfoundation audio device index
-  device_lines | awk -F'|' -v pat="$1" 'index(tolower($2), tolower(pat)) {print $1; exit}'
+  # an exact name wins: "Background Music" is a substring of "Background Music
+  # (UI Sounds)", which only carries alert sounds and can be listed first
+  local lines; lines="$(device_lines)"
+  printf '%s\n' "$lines" | awk -F'|' -v pat="$1" 'tolower($2) == tolower(pat) {print $1; f=1; exit} END {exit !f}' \
+    || printf '%s\n' "$lines" | awk -F'|' -v pat="$1" 'index(tolower($2), tolower(pat)) {print $1; exit}'
 }
 
 cmd_devices() {
@@ -92,9 +96,22 @@ spawn_capture() {
   echo $!
 }
 
+# Core Audio process taps (macOS 14.2+) capture what the Mac plays without a
+# virtual device in the output path. audiotee streams raw PCM; ffmpeg wraps it.
+tap_bin() { command -v "${MEETREC_AUDIOTEE:-audiotee}" 2>/dev/null; }
+
+spawn_tap() {
+  # spawn_tap <wav>
+  local log="${1%.wav}.log" tb; tb="$(tap_bin)"
+  ( "$tb" --sample-rate 48000 2>>"$log" \
+      | ffmpeg -hide_banner -loglevel warning -nostdin -f s16le -ar 48000 -ac 1 -i - \
+          -c:a pcm_s16le "$1" >>"$log" 2>&1 ) >/dev/null 2>&1 &
+  echo $!
+}
+
 verify_running() {
   # verify_running <pid> <wav> <label>
-  sleep 3
+  local _; for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do [[ -s "$2" ]] && break; sleep 0.5; done
   kill -0 "$1" 2>/dev/null || die "capture for $3 died on startup — check Microphone permission for your terminal in System Settings > Privacy & Security"
   [[ -s "$2" ]] || warn "$3: no audio bytes yet — check the device is actually producing sound"
 }
@@ -152,23 +169,46 @@ engage_output() {
 
 # Connecting AirPods (or any device macOS decides to prefer) steals the default
 # output mid-call, which silently cuts the far end out of the recording.
+# Output sample rate of a device as macOS reports it; a Bluetooth headset whose
+# mic is open drops from 48000 to 24000 or 16000 (headset mode).
+output_rate() {
+  system_profiler SPAudioDataType 2>/dev/null | awk -v want="$1" '
+    /^        [^ ].*:$/ { name=$0; sub(/^ +/, "", name); sub(/:$/, "", name); out=0; next }
+    name == want && /Output Channels:/ { out=1 }
+    name == want && out && /Current SampleRate:/ { print $NF; exit }'
+}
+
 # A meeting app (or the headset connecting) can also make the headset the system
 # mic, which drops it into headset mode and makes the meeting stutter. And a
 # capture can stall without exiting when Core Audio hiccups, so a track that
 # stops growing is reported instead of silently recording nothing.
 start_output_guard() {
-  local log="$1" headset="$2" mic="$3"; shift 3
-  ( local files=("$@") last=() stalled=() i
+  local log="$1" headset="$2" mic="$3" bgm="$4"; shift 4
+  ( local files=("$@") last=() stalled=() i hfp=""
     while :; do
       sleep 10
       [[ -e "$RUN_FILE" ]] || exit 0
-      if [[ "$(SwitchAudioSource -c -t output 2>/dev/null)" != "Background Music" ]]; then
+      if [[ "$bgm" == 1 && "$(SwitchAudioSource -c -t output 2>/dev/null)" != "Background Music" ]]; then
         echo "$(date -Iseconds) output was stolen; re-routing through Background Music" >> "$log"
         SwitchAudioSource -s "Background Music" -t output >/dev/null 2>&1 || true
       fi
       if [[ -n "$headset" && "$headset" != "$mic" && "$(SwitchAudioSource -c -t input 2>/dev/null)" == "$headset" ]]; then
         echo "$(date -Iseconds) input switched to $headset; moving it back to $mic" >> "$log"
         SwitchAudioSource -s "$mic" -t input >/dev/null 2>&1 || true
+      fi
+      # the app can also pick the headset mic in its own settings, which the
+      # system input never shows; headset mode gives it away in the sample rate
+      if [[ -n "$headset" && "$headset" != "$mic" ]]; then
+        local rate; rate="$(output_rate "$headset")"
+        if [[ -n "$rate" && "$rate" -lt 44100 ]]; then
+          if [[ -z "$hfp" ]]; then
+            hfp=1
+            echo "$(date -Iseconds) $headset in headset mode (${rate} Hz): an app is using its mic" >> "$log"
+            osascript -e "display notification \"An app is using the $headset mic. Set its mic to $mic or System default.\" with title \"meetrec\" sound name \"Basso\"" >/dev/null 2>&1 || true
+          fi
+        elif [[ -n "$hfp" && -n "$rate" ]]; then
+          hfp=""; echo "$(date -Iseconds) $headset back to ${rate} Hz" >> "$log"
+        fi
       fi
       local f sz
       for i in "${!files[@]}"; do
@@ -197,7 +237,9 @@ restore_output() {
   have_switcher || return 0
   if [[ "$launched" == "1" ]]; then
     osascript -e 'quit app "Background Music"' >/dev/null 2>&1 || true
-    sleep 2
+    # wait for it to actually exit: a 'call' started while it's still quitting
+    # sees it as running and records a dead device
+    for _ in $(seq 1 20); do pgrep -f "Background Music.app" >/dev/null 2>&1 || break; sleep 0.5; done
   fi
   SwitchAudioSource -a -t output 2>/dev/null | grep -qxF "$prev" || { warn "previous output device '$prev' is gone; leaving output as is"; return 0; }
   SwitchAudioSource -s "$prev" -t output >/dev/null 2>&1 || true
@@ -213,41 +255,58 @@ cmd_call() {
   local slug="${1:-call}"
   need ffmpeg ffmpeg
   busy_check
-  local prev_out; prev_out="$(engage_output)"
-  local sys mic mic_name
+  local prev_out="" listen sys="" mic mic_name use_tap=0
+  [[ -n "$(tap_bin)" && -z "${MEETREC_BGM:-}" ]] && use_tap=1
+  if [[ "$use_tap" == 1 ]]; then
+    listen="$(current_output)"
+  else
+    prev_out="$(engage_output)"; listen="${prev_out%%|*}"
+  fi
   # default the mic to whatever the system (and therefore the meeting app) is using
   mic_name="${MEETREC_MIC:-$(current_input)}"
   [[ -n "$mic_name" ]] || mic_name="MacBook Pro Microphone"
-  # Opening a wireless headset's mic drops the headset into headset mode, which
-  # halves its output rate (AirPods: 48k -> 24k). Background Music keeps feeding
-  # 48k, so the meeting plays back at half speed an octave down. Recording your
-  # voice from the built-in mic instead keeps the headset in output-only mode.
-  if [[ -z "${MEETREC_MIC:-}" && -n "${prev_out%%|*}" && "$mic_name" == "${prev_out%%|*}" ]]; then
-    warn "'$mic_name' is both your speaker and mic — recording from it would slow the meeting audio to half speed in your ears"
+  # Opening a wireless headset's mic drops the headset into headset mode: lower
+  # output rate, stuttering audio, and with Background Music the meeting plays at
+  # half speed. Recording your voice from the built-in mic keeps the headset in
+  # output-only mode.
+  if [[ -z "${MEETREC_MIC:-}" && -n "$listen" && "$mic_name" == "$listen" ]]; then
+    warn "'$mic_name' is both your speaker and mic — that puts it in headset mode"
     mic_name="MacBook Pro Microphone"
     warn "using the built-in mic instead; set your meeting app's mic to the MacBook mic too (MEETREC_MIC overrides)"
   fi
-  sys="$(audio_index "Background Music")" || true
+  if [[ "$use_tap" == 0 ]]; then
+    sys="$(audio_index "Background Music")" || true
+    [[ -n "${sys:-}" ]] || die "no system-audio capture — install audiotee (macOS 14.2+) or Background Music"
+  fi
   mic="$(audio_index "$mic_name")" || true
-  [[ -n "${sys:-}" ]] || die "no 'Background Music' device — install it (brew install --cask background-music) so system audio can be captured"
   [[ -n "${mic:-}" ]] || die "mic device '$mic_name' not found; run 'meetrec devices', then set MEETREC_MIC"
-  info "them ← Background Music (system audio) · you ← $mic_name"
+  if [[ "$use_tap" == 1 ]]; then
+    info "them ← system audio (Core Audio tap) · you ← $mic_name"
+  else
+    info "them ← Background Music (system audio) · you ← $mic_name"
+  fi
   slug_paths "$slug"
   local pt pm
-  pt="$(spawn_capture "$sys" "${BASE}.them.wav")"
+  if [[ "$use_tap" == 1 ]]; then pt="$(spawn_tap "${BASE}.them.wav")"
+  else pt="$(spawn_capture "$sys" "${BASE}.them.wav")"; fi
   pm="$(spawn_capture "$mic" "${BASE}.me.wav")"
   verify_running "$pt" "${BASE}.them.wav" "them (system audio)"
   verify_running "$pm" "${BASE}.me.wav" "you (mic)"
   { echo "mode=call"; echo "started=$(date -Iseconds)"; echo "prev_output=$prev_out";
     echo "pid=$pt wav=${BASE}.them.wav"; echo "pid=$pm wav=${BASE}.me.wav"; } > "$RUN_FILE"
-  local guard; guard="$(start_output_guard "${BASE}.guard.log" "$(bgm_target)" "$mic_name" "${BASE}.them.wav" "${BASE}.me.wav")"
+  local headset; headset="$listen"; [[ "$use_tap" == 0 ]] && headset="$(bgm_target)"
+  local guard; guard="$(start_output_guard "${BASE}.guard.log" "$headset" "$mic_name" "$((1 - use_tap))" "${BASE}.them.wav" "${BASE}.me.wav")"
   echo "guard=$guard" >> "$RUN_FILE"
   ok "recording (call)"
-  [[ -n "$(bgm_target)" ]] && echo "   you'll hear the meeting on: $(bgm_target)"
+  [[ -n "$headset" ]] && echo "   you'll hear the meeting on: $headset"
   echo "   them → ${BASE}.them.wav"
   echo "   you  → ${BASE}.me.wav"
-  [[ -n "${prev_out%%|*}" ]] && echo "   output routed via Background Music (restored to '${prev_out%%|*}' on stop)"
-  echo "   in Teams/Zoom, set the speaker to 'Background Music' or 'Same as System'"
+  if [[ "$use_tap" == 1 ]]; then
+    echo "   leave the meeting app's speaker on any device; set its mic to $mic_name or System default"
+  else
+    [[ -n "$listen" ]] && echo "   output routed via Background Music (restored to '$listen' on stop)"
+    echo "   in Teams/Zoom/WhatsApp, set the speaker to 'Background Music' or 'Same as System'"
+  fi
   echo "   stop with: meetrec stop"
 }
 
@@ -277,6 +336,7 @@ cmd_stop() {
   prev_out="$(sed -nE 's/^prev_output=(.*)$/\1/p' "$RUN_FILE")"
   local guard; guard="$(sed -nE 's/^guard=([0-9]+)$/\1/p' "$RUN_FILE")"
   [[ -n "$guard" ]] && kill "$guard" 2>/dev/null || true
+  pkill -INT -x "$(basename "${MEETREC_AUDIOTEE:-audiotee}")" 2>/dev/null || true
   for pid in $pids; do kill -INT "$pid" 2>/dev/null || true; done
   for _ in $(seq 1 20); do
     local alive=0
@@ -421,25 +481,35 @@ cmd_check() {
   chk "ffmpeg installed"            "command -v ffmpeg"
   chk "whisper-cli installed"       "command -v whisper-cli"
   chk "SwitchAudioSource installed" "command -v SwitchAudioSource"
-  chk "Background Music device"     "[[ -n \"\$(audio_index 'Background Music')\" ]]"
-  chk "Background Music.app present" "[[ -d '/Applications/Background Music.app' ]]"
+  if [[ -n "$(tap_bin)" ]]; then
+    chk "audiotee installed (system audio via Core Audio tap)" "true"
+  else
+    chk "Background Music device"     "[[ -n \"\$(audio_index 'Background Music')\" ]]"
+    chk "Background Music.app present" "[[ -d '/Applications/Background Music.app' ]]"
+  fi
   chk "transcription model (large)" "[[ -f '$MODEL_DIR/ggml-large-v3.bin' ]]"
   chk "VAD model"                   "[[ -f '$MODEL_DIR/ggml-silero-v5.1.2.bin' ]]"
 
   info "live capture test (3s, both tracks)"
   local tmp; tmp="$(mktemp -d)"; trap 'rm -rf "$tmp"' RETURN
-  local prev; prev="$(engage_output)"
-  local sys mic mic_name
+  local prev="" sys mic mic_name p1
   mic_name="${MEETREC_MIC:-$(current_input)}"; [[ -n "$mic_name" ]] || mic_name="MacBook Pro Microphone"
-  sys="$(audio_index "Background Music")"; mic="$(audio_index "$mic_name")"
-  ( ffmpeg -hide_banner -loglevel error -nostdin -f avfoundation -i ":$sys" -t 3 -c:a pcm_s16le -ar 48000 -ac 1 -y "$tmp/them.wav" >/dev/null 2>&1 ) &
-  local p1=$!
+  mic="$(audio_index "$mic_name")"
+  if [[ -n "$(tap_bin)" ]]; then
+    ( "$(tap_bin)" --sample-rate 48000 2>/dev/null | ffmpeg -hide_banner -loglevel error -nostdin -f s16le -ar 48000 -ac 1 -i - -t 3 -c:a pcm_s16le -y "$tmp/them.wav" >/dev/null 2>&1 ) &
+    p1=$!
+  else
+    prev="$(engage_output)"; sys="$(audio_index "Background Music")"
+    ( ffmpeg -hide_banner -loglevel error -nostdin -f avfoundation -i ":$sys" -t 3 -c:a pcm_s16le -ar 48000 -ac 1 -y "$tmp/them.wav" >/dev/null 2>&1 ) &
+    p1=$!
+  fi
   ( ffmpeg -hide_banner -loglevel error -nostdin -f avfoundation -i ":$mic" -t 3 -c:a pcm_s16le -ar 48000 -ac 1 -y "$tmp/me.wav" >/dev/null 2>&1 ) &
   local p2=$!
   sleep 1; say -v "${MEETREC_TEST_VOICE:-Monica}" "Prueba de sonido." >/dev/null 2>&1 || true
   # -t 3 doesn't end a capture whose device never delivers frames
   for _ in $(seq 1 16); do kill -0 $p1 2>/dev/null || kill -0 $p2 2>/dev/null || break; sleep 0.5; done
   pkill -9 -f "ffmpeg.*$tmp/" 2>/dev/null || true
+  [[ -n "$(tap_bin)" && ! -e "$RUN_FILE" ]] && { pkill -INT -x "$(basename "$(tap_bin)")" 2>/dev/null || true; }
   wait $p1 $p2 2>/dev/null || true
   restore_output "$prev"
   local pk
