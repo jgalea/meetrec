@@ -90,8 +90,12 @@ busy_check() {
 spawn_capture() {
   # spawn_capture <device-index> <wav>
   local log="${2%.wav}.log"
+  # AVFoundation drops mic buffers (about 11% on a MacBook mic), which shrinks
+  # the track and drifts it against the other one; resampling against the
+  # device timestamps fills the gaps with silence and keeps it on the clock
   caffeinate -i ffmpeg -hide_banner -loglevel warning -nostdin \
     -thread_queue_size 4096 -f avfoundation -i ":$1" \
+    -af "aresample=async=1000:first_pts=0" \
     -c:a pcm_s16le -ar 48000 -ac 1 "$2" >"$log" 2>&1 &
   echo $!
 }
