@@ -55,13 +55,15 @@ Two files come out: `*.them.wav` (system audio, everyone else) and `*.me.wav` (y
 
 Things worth knowing before your first real call:
 
-**Teams and Zoom have their own speaker picker.** If it names a specific device, the audio bypasses Background Music and the far end records silent. Set it to "Background Music" or "Same as System". Meet in a browser follows the system device and needs nothing.
+**Teams, Zoom and the WhatsApp desktop app have their own speaker and mic pickers.** If the speaker names a specific device, the audio bypasses Background Music and the far end records silent. Set it to "Background Music" or "Same as System", and set the mic to the built-in one or "System default", never the headset. Meet in a browser follows the system device and needs nothing.
 
 **Wear headphones.** On speakers the far end bleeds into your mic and both tracks transcribe the same words twice.
 
 **Wireless headsets can't be both speaker and mic here.** Opening an AirPods mic drops the headset into headset mode and halves its output rate, while Background Music keeps feeding 48 kHz, so the meeting plays back at half speed an octave down. When the mic and speaker resolve to the same wireless device, `call` falls back to the built-in mic and tells you to point the meeting app's mic at it too. Override with `MEETREC_MIC`.
 
-**Something can steal the default output mid-call.** Connecting AirPods is enough, and it silently cuts the far end out of the recording. A guard checks every 10 seconds and re-routes, logging each occurrence to a `.guard.log` beside the recording.
+**Something can steal the default output mid-call.** Connecting AirPods is enough, and it silently cuts the far end out of the recording. A guard checks every 10 seconds and re-routes, logging each occurrence to a `.guard.log` beside the recording. The same guard moves the system mic back off a wireless headset when a meeting app grabs it, which otherwise makes the call stutter.
+
+**A capture can stall without exiting.** When Core Audio hiccups, ffmpeg can keep running while its file stops growing, so one side of the call records nothing. The guard checks both files every 10 seconds and raises a notification on a stall. `stop` force-kills a hung capture so it can't keep holding the device into the next recording.
 
 ## In-person meetings
 
