@@ -73,6 +73,9 @@ slug_paths() {
 
 busy_check() {
   [[ -e "$RUN_FILE" ]] && die "a recording is already running (meetrec stop / meetrec status)"
+  # a capture orphaned by a crash keeps the device open and can stall the new one
+  local orphans; orphans="$(pgrep -f 'ffmpeg.*-f avfoundation' 2>/dev/null | tr '\n' ' ' || true)"
+  [[ -z "${orphans// /}" ]] || warn "leftover ffmpeg capture(s) still running (pid ${orphans% }); they can stall this recording — kill them first"
   return 0
 }
 
@@ -134,7 +137,7 @@ engage_output() {
     # a freshly installed BGM can come up with no output device and ignore the
     # first set; a relaunch picks the device list up properly
     osascript -e 'quit app "Background Music"' >/dev/null 2>&1 || true
-    sleep 2; open -a "Background Music" 2>/dev/null; launched=1; sleep 6
+    sleep 2; open -a "Background Music" 2>/dev/null || true; launched=1; sleep 6
     set_bgm_target "$prev"; tgt="$(bgm_target)"
   fi
   if [[ "$tgt" != "$prev" ]]; then
