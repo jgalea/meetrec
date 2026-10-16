@@ -134,8 +134,14 @@ bgm_target() {
 # BGM forwards audio to whichever device it picked at launch, which is not
 # necessarily the one you're listening on — launch it while the laptop speakers
 # are default and your call comes out of the speakers instead of your headphones.
+# names go in as argv, never spliced into AppleScript source: device names are
+# set by whoever named the device
 set_bgm_target() {
-  osascript -e "tell application \"Background Music\" to set selected output device to (first output device whose name is \"$1\")" >/dev/null 2>&1
+  osascript -e 'on run argv' -e 'tell application "Background Music" to set selected output device to (first output device whose name is (item 1 of argv))' -e 'end run' -- "$1" >/dev/null 2>&1
+}
+
+notify() {
+  osascript -e 'on run argv' -e 'display notification (item 1 of argv) with title "meetrec" sound name "Basso"' -e 'end run' -- "$1" >/dev/null 2>&1 || true
 }
 
 engage_output() {
@@ -204,7 +210,7 @@ start_output_guard() {
           if [[ -z "$hfp" ]]; then
             hfp=1
             echo "$(date -Iseconds) $headset in headset mode (${rate} Hz): an app is using its mic" >> "$log"
-            osascript -e "display notification \"An app is using the $headset mic. Set its mic to $mic or System default.\" with title \"meetrec\" sound name \"Basso\"" >/dev/null 2>&1 || true
+            notify "An app is using the $headset mic. Set its mic to $mic or System default."
           fi
         elif [[ -n "$hfp" && -n "$rate" ]]; then
           hfp=""; echo "$(date -Iseconds) $headset back to ${rate} Hz" >> "$log"
@@ -218,7 +224,7 @@ start_output_guard() {
           [[ -n "${stalled[$i]:-}" ]] && continue
           stalled[$i]=1
           echo "$(date -Iseconds) STALLED: $f stopped growing" >> "$log"
-          osascript -e "display notification \"$(basename "$f") stopped recording\" with title \"meetrec\" sound name \"Basso\"" >/dev/null 2>&1 || true
+          notify "$(basename "$f") stopped recording"
         else
           [[ -n "${stalled[$i]:-}" ]] && echo "$(date -Iseconds) resumed: $f" >> "$log"
           stalled[$i]=""
