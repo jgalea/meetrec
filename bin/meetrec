@@ -396,16 +396,35 @@ cmd_import() {
   echo "   transcribe with: meetrec transcribe \"$WAV\""
 }
 
+# A phone or laptop records stereo from two mics a few cm apart, so both channels
+# carry the same conversation. Splitting that "into speakers" transcribes it twice.
+# Separate speaker tracks are uncorrelated, so their difference (side) is about as
+# loud as their sum (mid); one mixed recording has a side well below its mid.
+stereo_is_one_mix() {
+  local mid side
+  level() {
+    ffmpeg -hide_banner -nostdin -t 600 -i "$1" \
+      -af "pan=mono|c0=$2,astats=measure_perchannel=none:measure_overall=RMS_level" -f null - 2>&1 \
+      | awk -F': ' '/RMS level dB/ {v=$2} END {print v}'
+  }
+  mid="$(level "$1" "0.5*c0+0.5*c1")"; side="$(level "$1" "0.5*c0-0.5*c1")"
+  [[ "$side" == *inf* ]] && { info "stereo channels are identical"; return 0; }
+  info "stereo mid ${mid} dB, side ${side} dB"
+  awk -v m="$mid" -v s="$side" 'BEGIN { exit !(m - s >= 6) }'
+}
+
 cmd_transcribe() {
-  local src="" model="turbo" lang="$LANG_DEFAULT"
+  local src="" model="turbo" lang="$LANG_DEFAULT" split="auto"
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --model) model="$2"; shift 2 ;;
       --lang) lang="$2"; shift 2 ;;
+      --split) split="yes"; shift ;;
+      --mono) split="no"; shift ;;
       *) src="$1"; shift ;;
     esac
   done
-  [[ -n "$src" ]] || die "usage: meetrec transcribe <file|base> [--model turbo|large] [--lang es]"
+  [[ -n "$src" ]] || die "usage: meetrec transcribe <file|base> [--model turbo|large] [--lang es] [--split|--mono]"
   # accept a file, a base name, a bare slug (recordings are date-prefixed), or
   # any of those relative to $REC_DIR
   resolve() {
@@ -435,8 +454,10 @@ cmd_transcribe() {
 
   # whisper hallucinates filler ("Gracias por ver el video") into silence, and each
   # speaker's channel is silent whenever the other is talking. VAD gates that out.
+  # -mc 0 stops it feeding its own output back as context, which on long files
+  # can lock into repeating one sentence for the rest of the recording.
   run_whisper() {
-    "$wb" -m "$mp" -f "$1" -l "$lang" -oj -of "$2" \
+    "$wb" -m "$mp" -f "$1" -l "$lang" -oj -of "$2" -mc 0 \
       --vad --vad-model "$vad" -sns -nth 0.6 -et 2.4 -lpt -1.0 -pp >/dev/null 2>&1
   }
   prep() { ffmpeg -hide_banner -loglevel error -y -i "$1" -ar 16000 -ac 1 -c:a pcm_s16le "$2"; }
@@ -447,7 +468,8 @@ cmd_transcribe() {
     info "  whisper: them"; run_whisper "$tmp/them.wav" "$tmp/them"
     info "  whisper: me";   run_whisper "$tmp/me.wav"   "$tmp/me"
     python3 "$SELF_DIR/merge_channels.py" "$tmp/them.json" "$tmp/me.json" > "${base}.transcript.md"
-  elif [[ "$(ffprobe -v error -select_streams a:0 -show_entries stream=channels -of csv=p=0 "$src")" == "2" ]]; then
+  elif [[ "$split" != "no" && "$(ffprobe -v error -select_streams a:0 -show_entries stream=channels -of csv=p=0 "$src")" == "2" ]] \
+       && { [[ "$split" == "yes" ]] || ! stereo_is_one_mix "$src"; }; then
     info "stereo source — splitting channels into speakers"
     ffmpeg -hide_banner -loglevel error -y -i "$src" \
       -filter_complex "[0:a]channelsplit=channel_layout=stereo[L][R]" \
@@ -457,7 +479,7 @@ cmd_transcribe() {
     info "  whisper: me";   run_whisper "$tmp/me.wav"   "$tmp/me"
     python3 "$SELF_DIR/merge_channels.py" "$tmp/them.json" "$tmp/me.json" > "${base}.transcript.md"
   else
-    info "mono source — single-track transcript (no speaker labels)"
+    info "one mixed track — single transcript (no speaker labels)"
     prep "$src" "$tmp/mono.wav"
     run_whisper "$tmp/mono.wav" "$tmp/mono"
     python3 "$SELF_DIR/merge_channels.py" "$tmp/mono.json" > "${base}.transcript.md"
@@ -544,7 +566,7 @@ meetrec — local meeting recorder + transcriber
   meetrec stop               stop and finalize the current recording
   meetrec status             is anything recording
   meetrec import <file> [slug]  bring in an external recording (DJI Mic Mini, phone)
-  meetrec transcribe <file> [--model turbo|large] [--lang es]
+  meetrec transcribe <file> [--model turbo|large] [--lang es] [--split|--mono]
   meetrec fetch-model turbo|large
   meetrec devices            list audio inputs
   meetrec list               list recordings

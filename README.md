@@ -89,10 +89,12 @@ meetrec room acme-office        # MEETREC_ROOM_DEVICE=<n> to pick another input
 ## Transcription
 
 ```bash
-meetrec transcribe <file|base|slug> [--model turbo|large] [--lang es]
+meetrec transcribe <file|base|slug> [--model turbo|large] [--lang es] [--split|--mono]
 ```
 
-Writes `<base>.transcript.md`: timestamped, with `**THEM:**` / `**ME:**` labels on two-track sources. Re-run it with different settings as often as you like, the audio doesn't go anywhere.
+Writes `<base>.transcript.md`: timestamped, with `**THEM:**` / `**ME:**` labels on two-track sources.
+
+A stereo file only gets split into speakers when its channels really are separate. A phone or laptop records both channels from mics a few centimetres apart, so they carry the same conversation; `transcribe` measures that and treats the file as one track. `--split` or `--mono` overrides the check. Re-run it with different settings as often as you like, the audio doesn't go anywhere.
 
 `large` is meaningfully better on accented speech, overlapping speakers and room audio. `turbo` is fine for clean solo recordings.
 
