@@ -407,8 +407,17 @@ stereo_is_one_mix() {
       -af "pan=mono|c0=$2,astats=measure_perchannel=none:measure_overall=RMS_level" -f null - 2>&1 \
       | awk -F': ' '/RMS level dB/ {v=$2} END {print v}'
   }
+  # Ten minutes analysed, so measurements stay quick on long files. When the result
+  # is unclear, default to one track: a merged transcript still reads fine, a
+  # duplicated one doesn't.
+  local num='^-?[0-9]+(\.[0-9]+)?$'
   mid="$(level "$1" "0.5*c0+0.5*c1")"; side="$(level "$1" "0.5*c0-0.5*c1")"
+  if [[ ! "$mid" =~ $num ]]; then
+    warn "couldn't measure the stereo channels (silent or unreadable start); treating as one track. Pass --split if each channel is a different speaker."
+    return 0
+  fi
   [[ "$side" == *inf* ]] && { info "stereo channels are identical"; return 0; }
+  [[ "$side" =~ $num ]] || { warn "couldn't measure the stereo channels; treating as one track. Pass --split to override."; return 0; }
   info "stereo mid ${mid} dB, side ${side} dB"
   awk -v m="$mid" -v s="$side" 'BEGIN { exit !(m - s >= 6) }'
 }
